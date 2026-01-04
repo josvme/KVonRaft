@@ -1,0 +1,20 @@
+### Check if a node is a leader
+GET localhost:8003/leader
+
+### Send it to leader
+POST localhost:8003/insert
+Content-Type: application/json
+
+{
+  "key": "test-key",
+  "value": "test-value"
+}
+
+### Get value for a key
+GET localhost:8003/get?key=test-key
+
+### Get the full state of a node, useful for debugging
+GET localhost:8003/full
+
+### Kill the node
+GET localhost:8005/die
