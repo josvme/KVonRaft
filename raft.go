@@ -26,19 +26,30 @@ type Log struct {
 	Term    int
 	Content string
 }
+
+// Updated on stable storage before responding to RPCs. Should be durable
 type PersistentState struct {
+	// latest term server has seen. Starts at 0 and increases monotonically
 	currentTerm int
-	votedFor    int
-	log         map[int]Log
+	// CandidateId that received vote from this node in current term (null if none)
+	votedFor int
+	// Log Entries which contains command for state machine, along with Term when it was received.
+	log map[int]Log
 }
 
+// Volatile state on all servers
 type VolatileState struct {
+	// Index of the highest log entry that is committed. Starts at 0 and increases monotonically
 	commitIndex int
+	// Index of the highest log entry that is applied to state machine. Starts at 0 and increases monotonically
 	lastApplied int
 }
 
+// Volatile state on Leader, reset after each election
 type VolatileLeaderState struct {
-	nextIndex  map[int]int
+	// for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
+	nextIndex map[int]int
+	// for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
 	matchIndex map[int]int
 }
 
@@ -57,29 +68,49 @@ type Server struct {
 	logger              *slog.Logger
 }
 
+// Invoked by leader to replicate log entries. Also used for heartbeats.
 type AppendEntriesRequest struct {
-	Term         int
-	LeaderId     int
+	// Leaders term
+	Term int
+	// Leader Id, so follower can redirect clients to Leader
+	LeaderId int
+	// Index of log entry immediately preceding new ones. Raft uses it to avoid Gaps in the logs.
 	PrevLogIndex int
-	PrevLogTerm  int
-	Entries      []Log
+	// Term of the prevLogIndex entry
+	PrevLogTerm int
+	// Log entries to store (empty for heartbeat; may send more than one for efficiency)
+	Entries []Log
+	// Leaders commit
 	LeaderCommit int
 }
 
+// Response of AppendEntriesRequest
 type AppendEntriesResponse struct {
-	Term    int
+	// currentTerm of responding node. It is for the leader to update itself. If the responding node has higher term, the leader will
+	// become a follower.
+	Term int
+	// True if the follower contained entry matching prevLogIndex and prevLogTerm
 	Success bool
 }
 
+// Invoked by candidates to gather votes
 type RequestVoteRequest struct {
-	Term         int
-	CandidateId  int
+	// Candidates term
+	Term int
+	// Candidate requesting vote
+	CandidateId int
+	// Index of candidates' last log entry. During the election other followers will accept the request only if
+	// the candidate log is at least as up to date as the receivers log
 	LastLogIndex int
-	LastLogTerm  int
+	// Term of candidates last log entry
+	LastLogTerm int
 }
 
+// Response of RequestVoteRequest
 type RequestVoteResponse struct {
-	Term        int
+	// currentTerm of responding node, for the candidate to update itself.
+	Term int
+	// True if the candidate received the vote
 	VoteGranted bool
 }
 
@@ -190,18 +221,22 @@ func (s *Server) insertValueEndpoint(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mutex.Lock()
+	// Only the leader should accept the writes / reads
 	if s.role != "leader" {
 		s.mutex.Unlock()
 		http.Error(w, "Please send to leader node", http.StatusBadRequest)
 		return
 	}
 
-	// Add to local log the request
+	// Add to the local log, the values from request
+	// We use our term along with the command and value
 	lastIndex := s.getLastLogIndexLocked()
 	s.PeristentState.log[lastIndex+1] = Log{Term: s.PeristentState.currentTerm, Command: req.Key, Content: req.Value}
 
 	requests := make(map[int][]byte)
 
+	// nextIndex has the index of the log entry which should be sent next to the node
+	// matchIndex has the index of the highest log entry which is known to be replicated
 	// Send append requests based on nextIndex and matchIndex
 	for _, n := range s.neighbourNodes {
 		prevLogIndex := s.VolatileLeaderState.nextIndex[n] - 1
@@ -230,6 +265,7 @@ func (s *Server) insertValueEndpoint(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mutex.Unlock()
 
+	// Send the corresponding messages to all followers and get the response
 	successCount, rejectRequest := s.sendToFollowers(requests)
 
 	if rejectRequest {
@@ -237,15 +273,19 @@ func (s *Server) insertValueEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// It is a Success, append to our log
 	s.mutex.Lock()
+	// We got a majority of confirmations, so it is a success, lets append it to our log
 	if successCount >= len(s.neighbourNodes)/2 {
 		s.PeristentState.log[s.VolatileState.commitIndex+1] = Log{
 			Command: req.Key,
 			Term:    s.PeristentState.currentTerm,
 			Content: req.Value,
 		}
+		// Since we got confirmations from a majority, let's mark the entry as committed.
+		// In raft is an entry with id X is committed; all entries X-1,X-2..., etc. are also considered committed.
 		s.VolatileState.commitIndex++
+		// Apply the log to our state machine
+		// In our case it is a simple KV store
 		s.applySnapshotLocked()
 		commitIndex := s.VolatileState.commitIndex
 		s.mutex.Unlock()
@@ -263,14 +303,14 @@ func (s *Server) sendToFollowers(j map[int][]byte) (int, bool) {
 	for _, n := range s.neighbourNodes {
 		resp, err := http.Post("http://localhost:"+strconv.Itoa(8000+n)+"/appendEntries", "application/json", bytes.NewReader(j[n]))
 		if err != nil {
-			// move to next node
+			// There seems to be an error, move to the next node
 			continue
 		}
 
 		var appendEntriesResponse AppendEntriesResponse
 		err = json.NewDecoder(resp.Body).Decode(&appendEntriesResponse)
 		if err != nil {
-			// move to next node
+			// This shouldn't happen. Let's move to the next node
 			continue
 		}
 		outputs[n] = appendEntriesResponse
@@ -280,11 +320,10 @@ func (s *Server) sendToFollowers(j map[int][]byte) (int, bool) {
 	defer s.mutex.Unlock()
 	successCount := 0
 	rejectRequest := false
-	// Handle cases where followers gave false, because they are far behind
 	for nodeId, v := range outputs {
 		if v.Success {
-			// ideally index updates should be based on contents of j.
-			// But even if it is wrong, we have mechanism to fix this builtin to the raft protocol
+			// Ideally, index updates should be based on the contents of j.
+			// But even if it is wrong, we have a mechanism to fix this builtin to the raft protocol
 			lastLogIndex := s.getLastLogIndexLocked()
 			s.VolatileLeaderState.nextIndex[nodeId] = lastLogIndex + 1
 			s.VolatileLeaderState.matchIndex[nodeId] = lastLogIndex
@@ -297,6 +336,10 @@ func (s *Server) sendToFollowers(j map[int][]byte) (int, bool) {
 			rejectRequest = true
 			break
 		}
+		// Handle cases where followers gave false because they are far behind
+		// In this case, we send the previous log to follower. If it again fails,
+		// we try an even earlier log and so on until the follower has caught up or
+		// we reach the beginning of the log
 		if !v.Success {
 			// Logs are behind
 			s.VolatileLeaderState.nextIndex[nodeId] -= 1
@@ -333,21 +376,28 @@ func (s *Server) AppendEntries(request AppendEntriesRequest) AppendEntriesRespon
 		s.role = "follower"
 	}
 	out := AppendEntriesResponse{}
+
+	// If we have a more up to date term than the sender, we return success false
+	// This makes the sender step down to a follower role, and we will have a chance at being the leader
 	if request.Term < s.PeristentState.currentTerm {
 		out = AppendEntriesResponse{Term: s.PeristentState.currentTerm, Success: false}
 		return out
 	}
 
+	// Check if the previousLogIndex exists. This check is to prevent Gaps in logs.
+	// If the previous log is missing, we will send a false, which will let the
+	// leader know we are missing log entries. So leader will send earlier logs to us.
 	v, ok := s.PeristentState.log[request.PrevLogIndex]
 	if !ok {
 		s.logger.Info("AppendEntries failed, previous log not found", "request", request, "nodeId", s.nodeId)
 		return AppendEntriesResponse{Term: s.PeristentState.currentTerm, Success: false}
 	}
 
-	// term doesn't match
+	// The log exists, but the terms don't match
+	// We will have to delete all non-matching entries starting at this entry
+	// Leader always forces its entries on to the follower
 	if v.Term != request.PrevLogTerm {
 		s.logger.Info("AppendEntries failed", "request", request, "out", out, "nodeId", s.nodeId)
-		return AppendEntriesResponse{Term: s.PeristentState.currentTerm, Success: false}
 	}
 
 	// delete the existing entry and all following Entries in the request
@@ -384,7 +434,9 @@ func (s *Server) RequestVote(request RequestVoteRequest) RequestVoteResponse {
 	// To check if we should become a candidate
 	s.lastRequestTime = time.Now()
 
-	// Reset votedFor after election timeout time
+	// Raft guarantees that a node will not vote for two different candidates in a single term using votedFor
+	// This is also stored in a durable storage to have this guarantee
+	// We will reset votedFor after election timeout time, so that we can vote for another candidate or ourselves
 	if time.Since(s.lastVoteTime) > time.Second*1 {
 		s.PeristentState.votedFor = -1
 	}
@@ -394,7 +446,9 @@ func (s *Server) RequestVote(request RequestVoteRequest) RequestVoteResponse {
 		s.role = "follower"
 	}
 	out := RequestVoteResponse{}
-	// If we are more updated than the candidate
+	// If we are more updated than the candidate, we let the node know it.
+	// The node will see we are more updated than it and will step down to a follower role
+	// This will give us a chance to become a leader
 	if request.Term < s.PeristentState.currentTerm {
 		out = RequestVoteResponse{Term: s.PeristentState.currentTerm, VoteGranted: false}
 		s.logger.Info("RequestVote Overruled", "request", request, "out", out)
@@ -551,6 +605,8 @@ func (s *Server) startElection() {
 		if v.VoteGranted {
 			successCount++
 		}
+		// Raft uses Term as a Logical Clock. A node sent us a Term greater than our Term.
+		// This means that node is more updated. So we should become a follower and stop election.
 		if v.Term > s.PeristentState.currentTerm {
 			// There is someone with a more updated Term
 			s.role = "follower"
@@ -566,11 +622,12 @@ func (s *Server) startElection() {
 		return
 	}
 
-	// We vote for ourselves
+	// We need a majority (n/2 + 1). We already voted for ourselves
 	if successCount >= len(s.neighbourNodes)/2 {
 		s.logger.Info("New leader elected", "requestVote", requestVote, "nodeId", s.nodeId, "pid", os.Getpid())
 		s.role = "leader"
 		s.mutex.Unlock()
+		// Once we are elected leader, we should send an empty heartbeat for others to know, we have a new leader.
 		s.sendHeartBeatEmpty()
 		s.mutex.Lock()
 		// Initialize the nextIndex and matchIndex for each follower
@@ -583,13 +640,15 @@ func (s *Server) startElection() {
 		s.mutex.Unlock()
 		return
 	}
-	// Failed
+	// We didn't get majority votes, so we failed. So we go back to the follower role.
 	s.logger.Info("Election failed", "requestVote", requestVote, "nodeId", s.nodeId)
 	s.role = "follower"
 	s.mutex.Unlock()
 }
 
 func (s *Server) CandidateChecker() {
+	// A follower node constantly checks if it received a message from leader recently.
+	// If not, it will become a candidate and will start election.
 	for {
 		s.mutex.Lock()
 		if s.role == "follower" {
